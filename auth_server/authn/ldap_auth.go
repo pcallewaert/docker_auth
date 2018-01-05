@@ -24,21 +24,22 @@ import (
 	"io/ioutil"
 	"strings"
 
-	"github.com/go-ldap/ldap"
 	"github.com/cesanta/glog"
+	"github.com/go-ldap/ldap"
 )
 
 type LDAPAuthConfig struct {
-	Addr                  string `yaml:"addr,omitempty"`
-	TLS                   string `yaml:"tls,omitempty"`
-	InsecureTLSSkipVerify bool   `yaml:"insecure_tls_skip_verify,omitempty"`
-	CACertificate         string `yaml:"ca_certificate,omitempty"`
-	Base                  string `yaml:"base,omitempty"`
-	Filter                string `yaml:"filter,omitempty"`
-	BindDN                string `yaml:"bind_dn,omitempty"`
-	BindPasswordFile      string `yaml:"bind_password_file,omitempty"`
-	GroupBaseDN           string `yaml:"group_base_dn,omitempty"`
-	GroupFilter           string `yaml:"group_filter,omitempty"`
+	Addr                           string   `yaml:"addr,omitempty"`
+	TLS                            string   `yaml:"tls,omitempty"`
+	InsecureTLSSkipVerify          bool     `yaml:"insecure_tls_skip_verify,omitempty"`
+	CACertificate                  string   `yaml:"ca_certificate,omitempty"`
+	Base                           string   `yaml:"base,omitempty"`
+	Filter                         string   `yaml:"filter,omitempty"`
+	BindDN                         string   `yaml:"bind_dn,omitempty"`
+	BindPasswordFile               string   `yaml:"bind_password_file,omitempty"`
+	GroupSearchFilter              string   `yaml:"group_search_filter"`
+	GroupSearchFilterUserAttribute string   `yaml:"group_search_filter_user_attribute"`
+	GroupSearchBaseDNs             []string `yaml:"group_search_base_dns"`
 }
 
 type LDAPAuth struct {
@@ -94,8 +95,16 @@ func (la *LDAPAuth) Authenticate(account string, password PasswordString) (bool,
 	if bindErr := la.bindReadOnlyUser(l); bindErr != nil {
 		return false, nil, bindErr
 	}
+	labels := Labels{}
+	// TODO: use the cn of the result instead of the user input
+	groups, err := la.searchPosixScheme(l, account)
+	if err != nil {
+		glog.V(2).Infof("Unable to process posix group search: %v\n", err)
+	} else {
+		labels["groups"] = groups
+	}
 
-	return true, nil, nil
+	return true, labels, nil
 }
 
 func (la *LDAPAuth) bindReadOnlyUser(l *ldap.Conn) error {
@@ -108,6 +117,7 @@ func (la *LDAPAuth) bindReadOnlyUser(l *ldap.Conn) error {
 		glog.V(2).Infof("Bind read-only user (DN = %s)", la.config.BindDN)
 		err = l.Bind(la.config.BindDN, password_str)
 		if err != nil {
+			glog.V(2).Info("Failed to authenticate as read-only user")
 			return err
 		}
 	}
@@ -229,4 +239,65 @@ func (la *LDAPAuth) Stop() {
 
 func (la *LDAPAuth) Name() string {
 	return "LDAP"
+}
+
+func (la *LDAPAuth) searchPosixScheme(l *ldap.Conn, name string) ([]string, error) {
+	var groupSearchResult *ldap.SearchResult
+	var err error
+	var memberOf []string
+
+	glog.V(2).Infof("GroupSearchBaseDNs: %s, GroupSearchFilter: %s", la.config.GroupSearchBaseDNs, la.config.GroupSearchFilter)
+	for _, groupSearchBase := range la.config.GroupSearchBaseDNs {
+		filter := strings.Replace(la.config.GroupSearchFilter, "%s", ldap.EscapeFilter(name), -1)
+
+		glog.V(2).Infof("Searching for user's groups with filter %s in searchbase %s", filter, groupSearchBase)
+
+		groupSearchReq := ldap.SearchRequest{
+			BaseDN:       groupSearchBase,
+			Scope:        ldap.ScopeWholeSubtree,
+			DerefAliases: ldap.NeverDerefAliases,
+			Attributes: []string{
+				// Here MemberOf would be the thing that identifies the group, which is normally 'cn'
+				la.config.GroupSearchFilterUserAttribute,
+			},
+			Filter: filter,
+		}
+
+		groupSearchResult, err = l.Search(&groupSearchReq)
+		if err != nil {
+			return nil, err
+		}
+		glog.V(2).Info(len(groupSearchResult.Entries))
+		if len(groupSearchResult.Entries) > 0 {
+			for i := range groupSearchResult.Entries {
+				memberOf = append(memberOf, getLdapAttrN(la.config.GroupSearchFilterUserAttribute, groupSearchResult, i))
+			}
+			break
+		}
+	}
+	return memberOf, nil
+}
+
+func getLdapAttrN(name string, result *ldap.SearchResult, n int) string {
+	for _, attr := range result.Entries[n].Attributes {
+		if attr.Name == name {
+			if len(attr.Values) > 0 {
+				return attr.Values[0]
+			}
+		}
+	}
+	return ""
+}
+
+func getLdapAttr(name string, result *ldap.SearchResult) string {
+	return getLdapAttrN(name, result, 0)
+}
+
+func getLdapAttrArray(name string, result *ldap.SearchResult) []string {
+	for _, attr := range result.Entries[0].Attributes {
+		if attr.Name == name {
+			return attr.Values
+		}
+	}
+	return []string{}
 }
